@@ -1,6 +1,6 @@
 GtkTextView {
 
-  background-color: rgb(128,128,204); 
+  background-color: rgb(128,128,204);
   color: white; }
 
 GtkTextView.view {
@@ -18,4 +18,27 @@ GtkTextView.view:selected {
 GtkListBoxRow {
 
   padding: 0;
+}
+
+label.output_container{
+  all: unset;
+  color: rgb(255, 255, 255);
+  background-color: rgb(225, 80, 10);
+  border-style: solid;
+  border-width: 2px;
+  border-color: rgb(250, 125, 50);
+}
+
+label.output_container.selected_border{
+  border-color: rgb(255, 255, 255);
+}
+
+label.output_container.targeted_border{
+  border-color: rgb(255, 255, 0);
+}
+
+
+label.output_container.instance {
+border-width: 3px;
+border-style: dashed;
 }

@@ -24,4 +24,6 @@ DEBUG_NONCALLB = c.new()
 DEBUG_TESTCONTAINER = c.new()
 DEBUG_TESTCONTAINER2 = c.new()
 
+DEBUG_GTK = c.new()
+
 CONT_CLASS = c.new()

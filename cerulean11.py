@@ -3,13 +3,12 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk
 from gi.repository import Gdk
 from gi.repository import Gio
-import cairo, math, random
-import dnd_treestore
+import cairo, math, random, dill
+import treestorage, gtk_groups
 from constants import *
 
-# WIP: Iffy naming here.
-from modules import modules
-from modules import noncalling
+from node_functions import functions
+from node_functions import noncalling
 
 class Config(object):
     scroll_inverted = False
@@ -17,7 +16,6 @@ class Config(object):
 
 class NumPrint(object):
     line = 0
-
     def printline(self, st):
         NumPrint.line += 1
         print(str(NumPrint.line) + '*: ' + st)
@@ -54,14 +52,10 @@ def recurse_bucket_draw(cr, bucket):
     cr.line_to(bucket.boundary[0], bucket.boundary[3])
     cr.line_to(bucket.boundary[0], bucket.boundary[1])
     cr.stroke()
-
     if bucket.buckets:
         recurse_bucket_draw(cr, bucket.buckets[0])
-
         recurse_bucket_draw(cr, bucket.buckets[1])
-
         recurse_bucket_draw(cr, bucket.buckets[2])
-
         recurse_bucket_draw(cr, bucket.buckets[3])
 
 
@@ -200,10 +194,11 @@ class Main(object):
     def add_object(self, t_obj):  # Add an object to the rendering list.
         self.containers.add(t_obj)
 
-        self.set_object_bounds(t_obj)
+        if not t_obj.is_gtk_widget:
+            self.set_object_bounds(t_obj)
 
-        w, h = main.drawarea_size
-        main.quadtree.boundary = [0, 0, w-1, h-1]
+        w, h = self.drawarea_size
+        self.quadtree.boundary = [0, 0, w-1, h-1]
 
         recurse_splitoverlap(self.quadtree, t_obj)
         split_adding(t_obj)
@@ -229,7 +224,7 @@ class Node(object):
 
         self.super_edges = []
         self.sub_edges = []
-        self.module_calling = True           # If false, this node is a variable assignment or input without ().
+        self.functional = True           # If false, this node is a variable assignment or input without ().
         self.index_flag = False  # Keeps track of whether the node was indexed, then whether the code was written.
 
     def add_subnode(self, sub_node, edgetype=0):  # Creates an edge from this node to a subnode; connecting the two.
@@ -241,8 +236,9 @@ class Node(object):
 class Container(object):
     def __init__(self, text="default", pos=(0, 0)):
         self.test_container = False  # WIP: Testing spacious containers.
-        self.render_cairo = True   # True if this is a cairo-drawn element, false if Gtk.
-        self.container_type = None  # Different container types with specific conditions.
+        self.is_gtk_widget = False   # True if this is a cairo-drawn element, false if Gtk.
+        self.gtks = None             # Class that holds all the gtk widgets for this container.
+        self.container_type = None   # Different container types with specific conditions.
         self.obj_id = main.new_obj_id()
         self.z_level = 0                    # z_level is how many sub containers down the object is
         self.z_index = main.new_z_index()   # z_index is determines which containers overlap on the same level.
@@ -269,7 +265,7 @@ class Container(object):
         self.text_x = 0
         self.text_y = 0
         self.buckets = []  # Quadtree buckets this object is a part of for removing.
-        main.add_object(self)
+
 
 
 class AppWindow(Gtk.ApplicationWindow):
@@ -314,6 +310,8 @@ class AppWindow(Gtk.ApplicationWindow):
         self.target_obj = None  # Object targeted with right click.
         self.mod_ctrl = False
         self.mod_shift = False
+
+        self.drag_creating_object = None  # Object being created before being dragged.
         # Drag'n'drop.
         self.selected_container_type = 0  # References a type of container. Selected when doing drag'n'drop.
         self.selected_container_name = ''      # Name of the referenced container.
@@ -355,7 +353,7 @@ class AppWindow(Gtk.ApplicationWindow):
         self.treecolumn.set_resizable(True)
         self.treeview.append_column(self.treecolumn)
 
-        dnd_treestore.additems(self.treestore, self.treeview)
+        treestorage.additems(self.treestore, self.treeview)
 
         # Bug: The last couple of trees are often hidden/clipped behind the next widgets if the tree expands too much.
         self.dragactions = Gdk.DragAction.COPY
@@ -395,9 +393,6 @@ class AppWindow(Gtk.ApplicationWindow):
         self.nm_rungraph.connect('button-press-event', self.cb_node_rungraph)
         self.nm_rungraph.show()
 
-        # Holds references to unique constructions for nodes that are wrapped in gtk widgets.
-        self.gtk_custom = {F_PYTHON: self.create_f_python}
-
         # CSS styling and settings >
         settings = Gtk.Settings.get_default()
         settings.props.gtk_button_images = True
@@ -420,6 +415,7 @@ class AppWindow(Gtk.ApplicationWindow):
 
     # Remake quadtrees altogether.
     def bucket_remake(self):
+        printline('bucket_remake')
         main.quadtree = QuadTree()
         w, h = main.drawarea_size
         main.quadtree.boundary = [0, 0, w - 1, h - 1]
@@ -457,7 +453,7 @@ class AppWindow(Gtk.ApplicationWindow):
             subnode = subedge.sub_node
 
             if subedge.edgetype == 1:  # Function edge between node and subnode.
-                if node.module_calling is True:
+                if node.functional is True:
                     self.indexing(subnode, idx)
                 else:
                     functional_edge = [False]
@@ -482,7 +478,7 @@ class AppWindow(Gtk.ApplicationWindow):
             supernode = superedge.super_node
 
             if superedge.edgetype == 1:  # Functional edge between node and supernode.
-                if supernode.module_calling is True:
+                if supernode.functional is True:
                     self.indexing(supernode, idx)
                 else:
                     # If any of its super nodes have solid connections to it, this a place for an upward marker.
@@ -508,7 +504,7 @@ class AppWindow(Gtk.ApplicationWindow):
     def upward_writing(self, node):
         params = []
 
-        if not node.module_calling:
+        if not node.functional:
             return node.node_name
 
         else:
@@ -526,13 +522,42 @@ class AppWindow(Gtk.ApplicationWindow):
             return paramstring
 
     def downward_writing(self, node):
-        if node.module_calling == True:
+        if node.functional == True:
             pass
         else:
             pass
 
     def recursive_writing(self, node):
         pass
+
+    def cb_savefile(self, widget):
+        print main.drawarea_size
+        main.windowsize = self.get_size()
+        with open('save.pkl', 'wb') as f:
+            dill.dump(main, f)
+
+    def cb_openfile(self, widget):
+        global main
+
+        for container in main.containers:
+            if container.is_gtk_widget:
+                self.widget_area.remove(container.gtks.fixed)
+
+        with open('save.pkl', 'rb') as f:
+            new_main = dill.load(f)
+        main = new_main
+
+        for container in main.containers:
+            if container.is_gtk_widget:
+                container.gtks.reconstruct(container)
+                self.widget_area.add_overlay(container.gtks.fixed)
+                self.widget_area.set_overlay_pass_through(container.gtks.fixed, True)
+                self.widget_area.show_all()
+
+
+        self.resize(main.windowsize[0], main.windowsize[1])
+        self.drawarea.set_size_request(main.drawarea_size[0], main.drawarea_size[1])
+        self.drawarea.queue_draw_area(0, 0, main.drawarea_size[0], main.drawarea_size[1])
 
     def cb_node_rungraph(self, widget, data):
         """ Indexing stage. Nodes are segmented into function chains for each index.
@@ -584,6 +609,19 @@ class AppWindow(Gtk.ApplicationWindow):
             return textview_return
         return nodefunction
 
+    def create_debug_gtk(self, node):
+        node.container.is_gtk_widget = True
+        node.container.gtks = gtk_groups.DebugBox(node.container)
+        self.widget_area.add_overlay(node.container.gtks.fixed)
+        self.widget_area.set_overlay_pass_through(node.container.gtks.fixed, True)
+        self.widget_area.show_all()
+
+        def nodefunction(node):
+            # WIP: Capture the last return line of the textview for this return value assuming it exists.
+            textview_return = None
+            return textview_return
+        return nodefunction
+
     def cb_drag_drop(self, widget, drag_context, x,y, time):
         # Create a node/object of the gathered type at the x/y.
         nodetext = self.selected_container_type
@@ -608,16 +646,17 @@ class AppWindow(Gtk.ApplicationWindow):
             cont.h = 400
             cont.text = 'classname'
             main.set_object_bounds(cont)
+        elif cont.container_type == DEBUG_GTK:
+            n.function = self.create_debug_gtk(cont.node)
+            n.container.gtks.fixed.move(n.container.gtks.label, n.container.x, n.container.y)
+
+        if not cont.is_gtk_widget:
+            n.function = functions[self.selected_container_type]
 
         if self.selected_container_type in noncalling:
-            n.module_calling = False
+            n.functional = False
 
-        # WIP: Gtk widgets.
-        if self.selected_container_type in self.gtk_custom:
-            cont.render_cairo
-            nodefunction = self.gtk_custom[self.selected_container_type](n)
-
-        n.function = modules[self.selected_container_type]
+        main.add_object(cont)
 
         # !: Copy-pasted from cb_release. Places the container into any containers it lands on.
         potential_overlaps = set()
@@ -672,6 +711,12 @@ class AppWindow(Gtk.ApplicationWindow):
 
     # TextView (EventBox) is clicked.
     def cb_edit_click(self, widget, event):
+        widget.get_window().set_cursor(Gdk.Cursor.new_from_name(self.get_display(), "row-resize"))
+        widget.get_child().set_can_focus(True)
+        widget.get_child().grab_focus()
+        widget.get_child().set_can_focus(False)
+
+    def cb_button_click(self, widget, event):
         widget.get_window().set_cursor(Gdk.Cursor.new_from_name(self.get_display(), "row-resize"))
         widget.get_child().set_can_focus(True)
         widget.get_child().grab_focus()
@@ -819,6 +864,9 @@ class AppWindow(Gtk.ApplicationWindow):
                     return obj3
         else:
             if bucket.objects:
+                if self.target_obj:
+                    if self.target_obj.is_gtk_widget:
+                        self.target_obj.gtks.label.get_style_context().remove_class("targeted_border")
                 self.target_obj = None
 
                 clicked_objects = {}
@@ -834,9 +882,20 @@ class AppWindow(Gtk.ApplicationWindow):
                         if self.mod_ctrl:  # Ctrl-add selection.
                             if selected_obj in self.selected_objects:  # Invert selection.
                                 sindex = self.selected_objects.index(selected_obj)
+                                if self.selected_objects[sindex].is_gtk_widget:
+                                    self.selected_objects[sindex].gtks.label.get_style_context().remove_class(
+                                        "targeted_border")
+                                    self.selected_objects[sindex].gtks.label.get_style_context().remove_class(
+                                        "selected_border")
                                 self.selected_objects.pop(sindex)
-                            self.selected_objects.append(selected_obj)
+                            else:
+                                self.selected_objects.append(selected_obj)
                         else:
+                            for sobj in self.selected_objects:
+                                if sobj.is_gtk_widget:
+                                    sobj.gtks.label.get_style_context().remove_class("targeted_border")
+                                    sobj.gtks.label.get_style_context().remove_class("selected_border")
+
                             self.selected_objects = [selected_obj]
                         self.flag_objectdragging = True
 
@@ -886,9 +945,11 @@ class AppWindow(Gtk.ApplicationWindow):
                     elif event.button == Gdk.BUTTON_SECONDARY:
                         if selected_obj.node:
                             self.target_obj = selected_obj
+                            if selected_obj.is_gtk_widget:
+                                selected_obj.gtks.label.get_style_context().add_class("targeted_border")
+
+
                         self.nodemenu.popup(None, None, None, None, event.button, event.time)
-                        # WIP: ??
-                        self.nodemenu.connect
                     return selected_obj
                 self.drawarea.queue_draw_area(0, 0, main.drawarea_size[0], main.drawarea_size[1])
 
@@ -902,12 +963,27 @@ class AppWindow(Gtk.ApplicationWindow):
             vpos = self.scroll_draw.get_vadjustment().get_value()
 
             clickedobject = self.recurse_click(main.quadtree, event, hpos, vpos)
+
+            for sobj in self.selected_objects:
+                if sobj.is_gtk_widget:
+                    self.widget_area.reorder_overlay(sobj.gtks.fixed, -1)
+                    sobj.gtks.label.get_style_context().add_class("selected_border")
+                    sobj.gtks.label.set_size_request(100,100)
+
             if not clickedobject:
                 if not self.flag_objectdragging:
                     self.flag_scrolldragging = True
                     self.scroll_initial_click = (event.x, event.y)
                     self.scroll_initial_adjustment = (hpos, vpos)
+                    for sobj in self.selected_objects:
+                        if sobj.is_gtk_widget:
+                            sobj.gtks.label.get_style_context().remove_class("targeted_border")
+                            sobj.gtks.label.get_style_context().remove_class("selected_border")
                     self.selected_objects = []
+
+                    if self.target_obj:
+                        if self.target_obj.is_gtk_widget:
+                            self.target_obj.gtks.label.get_style_context().remove_class("targeted_border")
                     self.target_obj = None
             self.eventbox.grab_focus()
             self.flag_clicked = True
@@ -995,6 +1071,10 @@ class AppWindow(Gtk.ApplicationWindow):
 
                 gobj.x = new_posx
                 gobj.y = new_posy
+
+                if gobj.is_gtk_widget:
+                    gobj.gtks.fixed.move(gobj.gtks.label, gobj.x, gobj.y)
+
                 coindex += 1
             self.drawarea.queue_draw_area(0, 0, main.drawarea_size[0], main.drawarea_size[1])
         elif self.flag_scrolldragging:
@@ -1135,9 +1215,11 @@ class AppWindow(Gtk.ApplicationWindow):
         if self.flag_expanded:  # Skip bucket_remake if this was resized by expanding.
             self.flag_expanded = False
         else:
-            # WIP: Only do this if the area has actually changed.
-            self.get_drawarea_size()
-            self.bucket_remake()
+            # TD: Only do this check when finished resizing
+            if main.drawarea_size[0]-1 > main.quadtree.boundary[2]:
+                self.bucket_remake()
+            if main.drawarea_size[1]-1 > main.quadtree.boundary[3]:
+                self.bucket_remake()
 
     def cb_draw(self, widget, cr):
         self.get_drawarea_size()
@@ -1152,7 +1234,7 @@ class AppWindow(Gtk.ApplicationWindow):
         #cr.fill()
 
         # Draw quadtree boundaries.
-        #recurse_bucket_draw(cr, main.quadtree)
+        recurse_bucket_draw(cr, main.quadtree)
 
         # Corner decoration.
         for n in xrange(0, 2):
@@ -1230,7 +1312,7 @@ class AppWindow(Gtk.ApplicationWindow):
             render_order_list.append(obj)
 
         for obj in render_order_list:
-            if isinstance(obj, Edge):
+            if obj.__class__.__name__ == 'Edge':
                 # Draw lines.
                 edge = obj
                 supernode = edge.super_node
@@ -1283,48 +1365,53 @@ class AppWindow(Gtk.ApplicationWindow):
                 cr.stroke_preserve()
                 cr.fill()
 
-            elif isinstance(obj, Container):
-                if obj.node:
-                    # Draw boxes
-                    cr.set_line_width(2)
-                    cr.set_line_cap(cairo.LINE_CAP_ROUND)
-                    if obj.node.module_calling is True:
-                        cr.set_dash([])
-                    else:
-                        cr.set_dash([5])
-                    # !: Using dashed lines fudges the rectangle outward. Maybe just slightly adjusting them works. (+1.., -2..)
-                    if self.target_obj == obj:
-                        cr.set_source_rgba(1, 1, 0, 1.0)
-                        cr.rectangle(obj.x + 1, obj.y + 1, obj.ext_width - 2, obj.ext_height - 2)
-                        cr.stroke()
-                        cr.fill()
-                    elif obj in self.selected_objects:
-                        cr.set_source_rgba(1, 1, 1, 1.0)
-                        cr.rectangle(obj.x + 1, obj.y + 1, obj.ext_width - 2, obj.ext_height - 2)
-                        cr.stroke()
-                        cr.fill()
-                    else:
-                        cr.set_source_rgba(0.5, 0.5, .8, 1.0)
-                        cr.rectangle(obj.x + 1, obj.y + 1, obj.ext_width - 2, obj.ext_height - 2)
-                        cr.stroke()
+            elif obj.__class__.__name__ == 'Container':
+                if obj.is_gtk_widget:
+                    w_h = obj.gtks.label.get_allocation()
+                    obj.ext_width = w_h.width
+                    obj.ext_height = w_h.height
+                else:
+                    if obj.node:
+                        # Draw boxes
+                        cr.set_line_width(2)
+                        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                        if obj.node.functional is True:
+                            cr.set_dash([])
+                        else:
+                            cr.set_dash([5])
+                        # !: Using dashed lines fudges the rectangle outward. Maybe just slightly adjusting them works. (+1.., -2..)
+                        if self.target_obj == obj:
+                            cr.set_source_rgba(1, 1, 0, 1.0)
+                            cr.rectangle(obj.x + 1, obj.y + 1, obj.ext_width - 2, obj.ext_height - 2)
+                            cr.stroke()
+                            cr.fill()
+                        elif obj in self.selected_objects:
+                            cr.set_source_rgba(1, 1, 1, 1.0)
+                            cr.rectangle(obj.x + 1, obj.y + 1, obj.ext_width - 2, obj.ext_height - 2)
+                            cr.stroke()
+                            cr.fill()
+                        else:
+                            cr.set_source_rgba(0.5, 0.5, .8, 1.0)
+                            cr.rectangle(obj.x + 1, obj.y + 1, obj.ext_width - 2, obj.ext_height - 2)
+                            cr.stroke()
+                            cr.fill()
+
+                        cr.set_source_rgba(0.3, 0.3, .6, 1.0)
+                        cr.rectangle(obj.x + 2, obj.y + 2, obj.ext_width - 4, obj.ext_height - 4)
+
                         cr.fill()
 
-                    cr.set_source_rgba(0.3, 0.3, .6, 1.0)
-                    cr.rectangle(obj.x + 2, obj.y + 2, obj.ext_width - 4, obj.ext_height - 4)
-
-                    cr.fill()
-
-                    # Draw text.
-                    cr.set_source_rgba(.9, .9, .9, 1.0)
-                    if obj.container_type == CONT_CLASS:
-                        # WIP: Need to do some serious text alignment here.
-                        cr.move_to((obj.x + obj.ext_width / 2) - obj.text_width / 2 - obj.text_x,
-                                   (obj.y + obj.text_height) - obj.text_height / 2 - obj.text_y)
-                        cr.show_text(obj.text)
-                    else:
-                        cr.move_to((obj.x + obj.ext_width / 2) - obj.text_width / 2 - obj.text_x,
-                                   (obj.y + obj.ext_height / 2) - obj.text_height / 2 - obj.text_y)
-                        cr.show_text(obj.text)
+                        # Draw text.
+                        cr.set_source_rgba(.9, .9, .9, 1.0)
+                        if obj.container_type == CONT_CLASS:
+                            # WIP: Need to do some serious text alignment here.
+                            cr.move_to((obj.x + obj.ext_width / 2) - obj.text_width / 2 - obj.text_x,
+                                       (obj.y + obj.text_height) - obj.text_height / 2 - obj.text_y)
+                            cr.show_text(obj.text)
+                        else:
+                            cr.move_to((obj.x + obj.ext_width / 2) - obj.text_width / 2 - obj.text_x,
+                                       (obj.y + obj.ext_height / 2) - obj.text_height / 2 - obj.text_y)
+                            cr.show_text(obj.text)
 
 
 def on_activate(app):

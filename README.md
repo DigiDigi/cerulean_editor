@@ -2,7 +2,7 @@
 
 A Python/PyTorch IDE by way of visual quasi-graph nodes.
 
-# WIP: Not yet working.
+# WIP: Not yet working. Still mostly prototyping.
 
 Code is built up by a series of connected nodes. You drag n' drop and
 connect functions/variables in a 2D area. It's meant to speed up
