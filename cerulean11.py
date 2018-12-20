@@ -3,12 +3,16 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk
 from gi.repository import Gdk
 from gi.repository import Gio
-import cairo, math, random, dill
+import cairo, math, random, dill, sys, resource
 import treestorage, gtk_groups
 from constants import *
 
 from node_functions import functions
 from node_functions import noncalling
+
+# Bug: Pickling/saving encounters recursion limits at 1000.
+# Not sure whether due to the fact that edges refer back to nodes or the fact that trees are usually deep.
+sys.setrecursionlimit(10000)
 
 class Config(object):
     scroll_inverted = False
@@ -303,6 +307,10 @@ class AppWindow(Gtk.ApplicationWindow):
         self.flag_scrolldragging = False  # Flagged when an empty space is clicked and held to scroll.
         self.flag_objectdragging = False  # Flagged when moving an object within the drawarea.
         self.flag_clicked = False  # Flagged after clicking so that release events don't fire out of order.
+
+        self.flag_resizing = False  # Flagged once clicked on a widgets resize handle
+        self.resize_side = 0        # 0-7 Eight directions clock-wise. 0 is right.
+
         self.grabbed_diff = []  # Space between the position of each grabbed box and the cursor.
         self.remove_grabbed = None # Reference to object being grabbed for temporary removal.
         self.grabbed_objects = []
@@ -321,7 +329,9 @@ class AppWindow(Gtk.ApplicationWindow):
         self.execstring = ''
 
         self.widget_area.set_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        #self.widget_area.set_events(Gdk.EventMask.POINTER_MOTION_MASK)
         self.eventbox.set_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        #self.eventbox.set_events(Gdk.EventMask.POINTER_MOTION_MASK)
 
         self.listview = self.builder.get_object("listview")
         self.liststore = Gtk.ListStore(str)
@@ -549,7 +559,7 @@ class AppWindow(Gtk.ApplicationWindow):
 
         for container in main.containers:
             if container.is_gtk_widget:
-                container.gtks.reconstruct(container)
+                container.gtks.reconstruct(container, self)
                 self.widget_area.add_overlay(container.gtks.fixed)
                 self.widget_area.set_overlay_pass_through(container.gtks.fixed, True)
                 self.widget_area.show_all()
@@ -611,7 +621,7 @@ class AppWindow(Gtk.ApplicationWindow):
 
     def create_debug_gtk(self, node):
         node.container.is_gtk_widget = True
-        node.container.gtks = gtk_groups.DebugBox(node.container)
+        node.container.gtks = gtk_groups.DebugBox(node.container, self)
         self.widget_area.add_overlay(node.container.gtks.fixed)
         self.widget_area.set_overlay_pass_through(node.container.gtks.fixed, True)
         self.widget_area.show_all()
@@ -648,7 +658,7 @@ class AppWindow(Gtk.ApplicationWindow):
             main.set_object_bounds(cont)
         elif cont.container_type == DEBUG_GTK:
             n.function = self.create_debug_gtk(cont.node)
-            n.container.gtks.fixed.move(n.container.gtks.label, n.container.x, n.container.y)
+            n.container.gtks.fixed.move(n.container.gtks.eventbox, n.container.x, n.container.y)
 
         if not cont.is_gtk_widget:
             n.function = functions[self.selected_container_type]
@@ -679,7 +689,6 @@ class AppWindow(Gtk.ApplicationWindow):
             newparent.children.add(cont)
             cont.parent = newparent
         self.recurse_zlevel(cont)
-
         self.bucket_remake()
         self.drawarea.queue_draw_area(0, 0, main.drawarea_size[0], main.drawarea_size[1])
 
@@ -954,7 +963,11 @@ class AppWindow(Gtk.ApplicationWindow):
                 self.drawarea.queue_draw_area(0, 0, main.drawarea_size[0], main.drawarea_size[1])
 
 
-    def cb_click(self, widget, event):
+    def cb_click(self, widget, event, container=None):
+        print widget
+        if container:
+            event.x += container.x
+            event.y += container.y
         if not self.flag_clicked:  # Flag to keep additional click events from firing before cb_release.
             # Keep this stuff in mind for rendering optimization..
             hvis = self.scroll_draw.get_hadjustment().get_page_size()  # Visible area.
@@ -968,7 +981,6 @@ class AppWindow(Gtk.ApplicationWindow):
                 if sobj.is_gtk_widget:
                     self.widget_area.reorder_overlay(sobj.gtks.fixed, -1)
                     sobj.gtks.label.get_style_context().add_class("selected_border")
-                    sobj.gtks.label.set_size_request(100,100)
 
             if not clickedobject:
                 if not self.flag_objectdragging:
@@ -997,8 +1009,11 @@ class AppWindow(Gtk.ApplicationWindow):
             for child in obj.children:
                 self.recurse_zlevel(child)
 
-    def cb_release(self, widget, event):
+    def cb_release(self, widget, event, container=None):
         # This is also called within the nodemenu so that click release properly clears flags.
+        if container:
+            event.x += int(container.x)
+            event.y += int(container.y)
         self.flag_scrolldragging = False
         self.flag_objectdragging = False
         if self.grabbed_objects:
@@ -1056,8 +1071,17 @@ class AppWindow(Gtk.ApplicationWindow):
             self.drawarea.queue_draw_area(0, 0, main.drawarea_size[0], main.drawarea_size[1])
         self.flag_clicked = False
 
-    def cb_motion(self, widget, event):
+    def cb_test1(self, widget, event):
+        print 'cb1', event.type
+
+
+    def cb_motion(self, widget, event, container=None):
         if self.flag_objectdragging:
+            if container:
+                # GTK Container motion adjustment
+                # Bug: Seems kinda wiggy with negatives.
+                event.x = container.x + event.x
+                event.y = container.y + event.y
             coindex = 0
             for gobj in self.grabbed_objects:
                 gox = event.x - self.grabbed_diff[coindex][0]
@@ -1073,7 +1097,7 @@ class AppWindow(Gtk.ApplicationWindow):
                 gobj.y = new_posy
 
                 if gobj.is_gtk_widget:
-                    gobj.gtks.fixed.move(gobj.gtks.label, gobj.x, gobj.y)
+                    gobj.gtks.fixed.move(gobj.gtks.eventbox, gobj.x, gobj.y)
 
                 coindex += 1
             self.drawarea.queue_draw_area(0, 0, main.drawarea_size[0], main.drawarea_size[1])
